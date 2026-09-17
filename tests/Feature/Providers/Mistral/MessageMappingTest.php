@@ -6,6 +6,8 @@ use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Storage;
 use Laravel\Ai\Files\Base64Document;
 use Laravel\Ai\Files\Base64Image;
+use Laravel\Ai\Files\Document;
+use Laravel\Ai\Files\LocalAudio;
 use Laravel\Ai\Files\LocalDocument;
 use Laravel\Ai\Files\LocalImage;
 use Laravel\Ai\Files\RemoteDocument;
@@ -237,7 +239,7 @@ test('stored document maps to an inline document url', function (): void {
 test('uploaded document maps to an inline document url', function (): void {
     Http::fake(['*' => $this->fakeTextResponse('I see a document')]);
 
-    $upload = UploadedFile::fake()->createWithContent('notes.txt', 'uploaded text contents', 'text/plain');
+    $upload = UploadedFile::fake()->createWithContent('notes.txt', 'uploaded text contents');
 
     agent('You are helpful.')->prompt(
         'What is in this document?',
@@ -255,6 +257,62 @@ test('uploaded document maps to an inline document url', function (): void {
             'document_name' => 'notes.txt',
         ];
     });
+});
+
+test('uploaded avif image maps to an image url', function (): void {
+    Http::fake(['*' => $this->fakeTextResponse('I see an image')]);
+
+    $upload = UploadedFile::fake()->createWithContent('shot.avif', 'avif-bytes');
+
+    agent('You are helpful.')->prompt(
+        'What is in this image?',
+        attachments: [$upload],
+        provider: 'mistral',
+    );
+
+    Http::assertSent(function (Request $request): bool {
+        $body = json_decode($request->body(), true);
+        $content = $body['messages'][1]['content'] ?? $body['messages'][0]['content'];
+
+        return collect($content)->firstWhere('type', 'image_url') === [
+            'type' => 'image_url',
+            'image_url' => ['url' => 'data:image/avif;base64,'.base64_encode('avif-bytes')],
+        ];
+    });
+});
+
+test('document without a name or mime type falls back to a pdf data uri', function (): void {
+    Http::fake(['*' => $this->fakeTextResponse('I see a document')]);
+
+    agent('You are helpful.')->prompt(
+        'What is in this document?',
+        attachments: [Document::fromString('nameless contents')],
+        provider: 'mistral',
+    );
+
+    Http::assertSent(function (Request $request): bool {
+        $body = json_decode($request->body(), true);
+        $content = $body['messages'][1]['content'] ?? $body['messages'][0]['content'];
+
+        return collect($content)->firstWhere('type', 'document_url') === [
+            'type' => 'document_url',
+            'document_url' => 'data:application/pdf;base64,'.base64_encode('nameless contents'),
+            'document_name' => 'document',
+        ];
+    });
+});
+
+test('unsupported attachment type throws', function (): void {
+    Http::fake(['*' => $this->fakeTextResponse()]);
+
+    expect(fn () => agent('You are helpful.')->prompt(
+        'What is in this recording?',
+        attachments: [new LocalAudio(__DIR__.'/../../../Fixtures/audio.mp3')],
+        provider: 'mistral',
+    ))->toThrow(
+        InvalidArgumentException::class,
+        'Mistral only supports image and document attachments. Unsupported attachment type ['.LocalAudio::class.'].',
+    );
 });
 
 test('system instructions are in messages array', function (): void {

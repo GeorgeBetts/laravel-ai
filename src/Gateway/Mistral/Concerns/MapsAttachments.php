@@ -6,18 +6,20 @@ use Illuminate\Http\UploadedFile;
 use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\Storage;
 use InvalidArgumentException;
-use Laravel\Ai\Files\Base64Document;
+use Laravel\Ai\Contracts\Files\StorableFile;
 use Laravel\Ai\Files\Base64Image;
+use Laravel\Ai\Files\Document;
 use Laravel\Ai\Files\File;
-use Laravel\Ai\Files\LocalDocument;
 use Laravel\Ai\Files\LocalImage;
 use Laravel\Ai\Files\RemoteDocument;
 use Laravel\Ai\Files\RemoteImage;
-use Laravel\Ai\Files\StoredDocument;
 use Laravel\Ai\Files\StoredImage;
+use Laravel\Ai\Gateway\Concerns\ResolvesDocumentFilenames;
 
 trait MapsAttachments
 {
+    use ResolvesDocumentFilenames;
+
     /**
      * Map the given Laravel attachments to Chat Completions content parts.
      */
@@ -53,35 +55,23 @@ trait MapsAttachments
                     'type' => 'image_url',
                     'image_url' => ['url' => 'data:'.$attachment->getClientMimeType().';base64,'.base64_encode($attachment->get())],
                 ],
-                $attachment instanceof Base64Document => [
-                    'type' => 'document_url',
-                    'document_url' => 'data:'.($attachment->mimeType() ?? 'application/octet-stream').';base64,'.$attachment->base64,
-                    'document_name' => $attachment->name(),
-                ],
-                $attachment instanceof LocalDocument => [
-                    'type' => 'document_url',
-                    'document_url' => 'data:'.($attachment->mimeType() ?? 'application/octet-stream').';base64,'.base64_encode(file_get_contents($attachment->path)),
-                    'document_name' => $attachment->name(),
-                ],
-                $attachment instanceof StoredDocument => [
-                    'type' => 'document_url',
-                    'document_url' => 'data:'.($attachment->mimeType() ?? 'application/octet-stream').';base64,'.base64_encode(
-                        (string) Storage::disk($attachment->disk)->get($attachment->path)
-                    ),
-                    'document_name' => $attachment->name(),
-                ],
                 $attachment instanceof RemoteDocument => [
                     'type' => 'document_url',
                     'document_url' => $attachment->url,
-                    'document_name' => $attachment->name() ?? basename($attachment->url),
+                    'document_name' => $attachment->name(),
+                ],
+                $attachment instanceof Document && $attachment instanceof StorableFile => [
+                    'type' => 'document_url',
+                    'document_url' => 'data:'.($attachment->mimeType() ?? 'application/pdf').';base64,'.base64_encode($attachment->content()),
+                    'document_name' => $attachment->name() ?? $this->fallbackFilename($attachment->mimeType()),
                 ],
                 $attachment instanceof UploadedFile => [
                     'type' => 'document_url',
-                    'document_url' => 'data:'.($attachment->getClientMimeType() ?? 'application/octet-stream').';base64,'.base64_encode($attachment->get()),
+                    'document_url' => 'data:'.$attachment->getClientMimeType().';base64,'.base64_encode($attachment->get()),
                     'document_name' => $attachment->getClientOriginalName(),
                 ],
                 default => throw new InvalidArgumentException(
-                    'Unsupported attachment type ['.$attachment::class.'].'
+                    'Mistral only supports image and document attachments. Unsupported attachment type ['.$attachment::class.'].'
                 ),
             };
         })->all();
@@ -97,7 +87,7 @@ trait MapsAttachments
             'image/png',
             'image/gif',
             'image/webp',
-        ],
-            true);
+            'image/avif',
+        ], true);
     }
 }
