@@ -1,6 +1,7 @@
 <?php
 
 use Illuminate\Support\Facades\Http;
+use Laravel\Ai\Files\Base64Document;
 use Laravel\Ai\Exceptions\StreamErrorException;
 use Laravel\Ai\Responses\Data\FinishReason;
 use Laravel\Ai\Streaming\Events\Error;
@@ -11,6 +12,7 @@ use Laravel\Ai\Streaming\Events\TextEnd;
 use Laravel\Ai\Streaming\Events\TextStart;
 use Laravel\Ai\Streaming\Events\ToolCall as ToolCallEvent;
 use Laravel\Ai\Streaming\Events\ToolResult as ToolResultEvent;
+use Tests\Fixtures\Agents\AssistantAgent;
 use Tests\Fixtures\Agents\ProviderOptionsWithToolsAgent;
 
 beforeEach(function (): void {
@@ -41,6 +43,46 @@ test('streaming emits text events', function (): void {
         ->and($events[3])->toBeInstanceOf(TextDelta::class)->delta->toBe(' world')
         ->and($events[4])->toBeInstanceOf(TextEnd::class)
         ->and($events[5])->toBeInstanceOf(StreamEnd::class);
+});
+
+test('streaming sends inline document attachments', function (): void {
+    Http::fake([
+        '*' => Http::response(
+            body: $this->ssePayload([
+                ['id' => 'chatcmpl-123', 'object' => 'chat.completion.chunk', 'model' => 'mistral-medium-latest', 'choices' => [['index' => 0, 'delta' => ['role' => 'assistant', 'content' => 'Hello'], 'finish_reason' => null]]],
+                ['id' => 'chatcmpl-123', 'object' => 'chat.completion.chunk', 'model' => 'mistral-medium-latest', 'choices' => [['index' => 0, 'delta' => [], 'finish_reason' => 'stop']], 'usage' => ['prompt_tokens' => 10, 'completion_tokens' => 5]],
+            ]),
+            status: 200,
+            headers: ['Content-Type' => 'text/event-stream'],
+        ),
+    ]);
+
+    $events = [];
+
+    foreach ((new AssistantAgent)->stream(
+        'Read this document.',
+        attachments: [(new Base64Document(base64_encode('streamed document'), 'text/plain'))->as('notes.txt')],
+        provider: 'mistral',
+    ) as $event) {
+        $events[] = $event;
+    }
+
+    Http::assertSent(function ($request): bool {
+        $body = $request->data();
+        $content = $body['messages'][1]['content'] ?? $body['messages'][0]['content'];
+
+        return collect($content)->firstWhere('type', 'document_url') === [
+            'type' => 'document_url',
+            'document_url' => 'data:text/plain;base64,'.base64_encode('streamed document'),
+            'document_name' => 'notes.txt',
+        ];
+    });
+
+    expect($events[0])->toBeInstanceOf(StreamStart::class)
+        ->and($events[1])->toBeInstanceOf(TextStart::class)
+        ->and($events[2])->toBeInstanceOf(TextDelta::class)->delta->toBe('Hello')
+        ->and($events[3])->toBeInstanceOf(TextEnd::class)
+        ->and($events[4])->toBeInstanceOf(StreamEnd::class);
 });
 
 test('streaming flattens block content deltas', function (): void {
