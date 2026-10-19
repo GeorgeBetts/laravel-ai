@@ -1,6 +1,30 @@
 # Release Notes
 
-## [Unreleased](https://github.com/laravel/ai/compare/v1.2.3...1.x)
+## [Unreleased](https://github.com/laravel/ai/compare/v1.3.0...1.x)
+
+## [v1.3.0](https://github.com/laravel/ai/compare/v1.2.3...v1.3.0) - 2026-10-19
+
+### What's Changed
+
+* Bump source-map-js from 1.2.1 to 1.2.2 in /workbench by [@dependabot](https://github.com/dependabot)[bot] in https://github.com/laravel/ai/pull/1142
+* Encode file and store IDs as a single URL path segment by [@pushpak1300](https://github.com/pushpak1300) in https://github.com/laravel/ai/pull/1140
+* Bump shivammathur/setup-php from 2.37.2 to 2.40.0 in the github-actions group by [@dependabot](https://github.com/dependabot)[bot] in https://github.com/laravel/ai/pull/1148
+* Fix HTML escaping in image responses by [@pushpak1300](https://github.com/pushpak1300) in https://github.com/laravel/ai/pull/1149
+* Bound shared $ref expansion in the schema normalizer by [@pushpak1300](https://github.com/pushpak1300) in https://github.com/laravel/ai/pull/1145
+* [1.x] Separate text blocks around server tools in Anthropic responses by [@rejaulalomkhan](https://github.com/rejaulalomkhan) in https://github.com/laravel/ai/pull/1143
+* Narrow the prompt return type for structured output agents by [@AbdelrhmanSaid](https://github.com/AbdelrhmanSaid) in https://github.com/laravel/ai/pull/1138
+* [1.x] Preserve raw HTTP responses on stored and retrieved files by [@rejaulalomkhan](https://github.com/rejaulalomkhan) in https://github.com/laravel/ai/pull/1146
+* Fix Gemini file search metadata filters by [@pushpak1300](https://github.com/pushpak1300) in https://github.com/laravel/ai/pull/1144
+* Limit the size of fetched remote files by [@pushpak1300](https://github.com/pushpak1300) in https://github.com/laravel/ai/pull/1139
+* Open a rebuilt Gemini turn with its thought step by [@gostavo9911](https://github.com/gostavo9911) in https://github.com/laravel/ai/pull/1150
+
+### New Contributors
+
+* [@rejaulalomkhan](https://github.com/rejaulalomkhan) made their first contribution in https://github.com/laravel/ai/pull/1143
+* [@AbdelrhmanSaid](https://github.com/AbdelrhmanSaid) made their first contribution in https://github.com/laravel/ai/pull/1138
+* [@gostavo9911](https://github.com/gostavo9911) made their first contribution in https://github.com/laravel/ai/pull/1150
+
+**Full Changelog**: https://github.com/laravel/ai/compare/v1.2.3...v1.3.0
 
 ## [v1.2.3](https://github.com/laravel/ai/compare/v1.2.2...v1.2.3) - 2026-10-15
 
