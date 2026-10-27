@@ -1,5 +1,32 @@
 # Upgrade Guide
 
+## Upgrading To 1.4 From 1.3
+
+### Mistral Default Models
+
+**Likelihood Of Impact: Medium**
+
+The Mistral provider's default and smartest text models are now `mistral-large-4-0`, its default audio model is now `voxtral-mini-tts-3-0`, and its default transcription model is now `voxtral-mini-transcribe-3-0`. These models are in public preview on Mistral, and Mistral Large 4 is priced higher than Mistral Large 3. To stay on the previous models, pin them in your provider configuration:
+
+```php
+'mistral' => [
+    'driver' => 'mistral',
+    'key' => env('MISTRAL_API_KEY'),
+    'models' => [
+        'text' => [
+            'default' => 'mistral-large-2512',
+            'smartest' => 'mistral-medium-3-5',
+        ],
+        'audio' => [
+            'default' => 'voxtral-mini-tts-2603',
+        ],
+        'transcription' => [
+            'default' => 'voxtral-mini-2602',
+        ],
+    ],
+],
+```
+
 ## Upgrading To 1.2 From 1.0
 
 ### Classification Signatures Accept Attachments

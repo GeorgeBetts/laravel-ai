@@ -77,7 +77,7 @@ class MistralProvider extends Provider implements AudioProvider, EmbeddingProvid
      */
     public function defaultTextModel(): string
     {
-        return $this->config['models']['text']['default'] ?? 'mistral-large-4';
+        return $this->config['models']['text']['default'] ?? 'mistral-large-4-0';
     }
 
     /**
@@ -93,7 +93,7 @@ class MistralProvider extends Provider implements AudioProvider, EmbeddingProvid
      */
     public function smartestTextModel(): string
     {
-        return $this->config['models']['text']['smartest'] ?? 'mistral-large-4';
+        return $this->config['models']['text']['smartest'] ?? 'mistral-large-4-0';
     }
 
     /**
