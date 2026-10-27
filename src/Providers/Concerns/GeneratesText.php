@@ -9,6 +9,7 @@ use Laravel\Ai\Ai;
 use Laravel\Ai\Contracts\Agent;
 use Laravel\Ai\Contracts\Conversational;
 use Laravel\Ai\Contracts\ConversationStore;
+use Laravel\Ai\Contracts\HasSkills;
 use Laravel\Ai\Contracts\HasStructuredOutput;
 use Laravel\Ai\Contracts\HasTools;
 use Laravel\Ai\Contracts\Tool;
@@ -18,7 +19,6 @@ use Laravel\Ai\Events\PromptingAgent;
 use Laravel\Ai\Events\ToolApprovalRequested;
 use Laravel\Ai\Events\ToolApprovalResolved;
 use Laravel\Ai\Exceptions\ApprovalNotResumableException;
-use Laravel\Ai\Exceptions\FailoverableException;
 use Laravel\Ai\Gateway\RunContext;
 use Laravel\Ai\Gateway\TextGenerationOptions;
 use Laravel\Ai\Messages\UserMessage;
@@ -30,6 +30,7 @@ use Laravel\Ai\Responses\StructuredAgentResponse;
 use Laravel\Ai\Responses\StructuredTextResponse;
 use Laravel\Ai\Responses\TextResponse;
 use Laravel\Ai\Tools\AgentTool;
+use Laravel\Ai\Tools\LoadSkill;
 use Laravel\Ai\Tools\McpServerTool;
 use Laravel\Ai\Tools\McpTool;
 use Throwable;
@@ -58,7 +59,7 @@ trait GeneratesText
 
                     $agent = $prompt->agent;
 
-                    $messages = $this->withoutForeignProviderContentBlocks([
+                    $messages = $this->withoutForeignReplayBlocks([
                         ...($prompt->messages ?? []),
                         ...($agent instanceof Conversational ? $agent->messages() : []),
                     ]);
@@ -87,16 +88,24 @@ trait GeneratesText
                         $this->throwIfNotResumable($prompt);
                     }
 
-                    $agentResponse = $response instanceof StructuredTextResponse
-                        ? (new StructuredAgentResponse($invocationId, $response->structured, $response->text, $response->usage, $response->meta))
+                    $agentResponse = filled($schema)
+                        ? (new StructuredAgentResponse(
+                            $invocationId,
+                            $response instanceof StructuredTextResponse ? $response->structured : [],
+                            $response->text,
+                            $response->usage,
+                            $response->meta,
+                        ))
                             ->withMessages($response->messages)
                             ->withToolCallsAndResults($response->toolCalls, $response->toolResults)
                             ->withSteps($response->steps)
+                            ->withReasoning($response->reasoning)
                             ->withRawResponse($response->raw)
                         : (new AgentResponse($invocationId, $response->text, $response->usage, $response->meta))
                             ->withMessages($response->messages)
                             ->withToolCallsAndResults($response->toolCalls, $response->toolResults)
                             ->withSteps($response->steps)
+                            ->withReasoning($response->reasoning)
                             ->withRawResponse($response->raw);
 
                     $agentResponse->withPendingApprovals($response->pendingApprovals);
@@ -159,13 +168,20 @@ trait GeneratesText
      */
     protected function resolveTools(AgentPrompt $prompt): array
     {
-        $tools = $prompt->tools
-            ?? ($prompt->agent instanceof HasTools ? [...$prompt->agent->tools()] : []);
-
         return array_map(
             fn ($tool) => $this->resolveTool($tool),
-            $tools,
+            $prompt->tools ?? $this->declaredTools($prompt->agent),
         );
+    }
+
+    /**
+     * Get the tools the agent declares, including the tool that loads its skills.
+     */
+    protected function declaredTools(Agent $agent): array
+    {
+        $tools = $agent instanceof HasTools ? [...$agent->tools()] : [];
+
+        return $agent instanceof HasSkills ? LoadSkill::mergeInto($tools, $agent) : $tools;
     }
 
     /**
@@ -190,7 +206,10 @@ trait GeneratesText
      */
     protected function runContextFor(string $invocationId, AgentPrompt $prompt): RunContext
     {
-        return new RunContext($invocationId, $prompt->agent, $this, $prompt->model, $this->events);
+        return tap(
+            new RunContext($invocationId, $prompt->agent, $this, $prompt->model, $this->events),
+            fn (RunContext $context) => $prompt->setRunContext($context),
+        );
     }
 
     /**
@@ -199,9 +218,7 @@ trait GeneratesText
     protected function recordAgentFailure(string $invocationId, AgentPrompt $prompt, Throwable $exception, bool $retryable = true): void
     {
         // A failoverable exception is only terminal once the caller has run out of providers to try...
-        if ($retryable &&
-            ! $prompt->isFinalAttempt() &&
-            $exception instanceof FailoverableException) {
+        if ($retryable && $prompt->willRetry($exception)) {
             return;
         }
 

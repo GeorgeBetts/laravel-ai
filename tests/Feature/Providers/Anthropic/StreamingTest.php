@@ -79,6 +79,8 @@ describe('text streaming', function (): void {
             ->and($textEnds[0]->messageId)->toBe($textStarts[0]->messageId)
             ->and($textDeltas[0]->messageId)->toBe($textStarts[0]->messageId)
             ->and($textDeltas[1]->messageId)->toBe($textStarts[0]->messageId)
+            ->and($textDeltas[0]->delta)->toBe('First')
+            ->and($textDeltas[1]->delta)->toBe("\n\nSecond")
             ->and(array_search($textEnds[0], $events, true))->toBeGreaterThan(array_search($textDeltas[1], $events, true));
     });
 
@@ -293,6 +295,70 @@ describe('pause_turn', function (): void {
         expect($textDeltas)->not->toBeEmpty()
             ->and($textDeltas[0]->delta)->toBe('Resumed');
     });
+
+    test('streaming replays text blocks around a server tool without the separator', function (): void {
+        Http::fake([
+            'api.anthropic.com/*' => Http::sequence([
+                Http::response(
+                    body: $this->ssePayload([
+                        $this->messageStart(),
+                        $this->contentBlockStart(0, ['type' => 'text', 'text' => '']),
+                        $this->contentBlockDelta(0, ['type' => 'text_delta', 'text' => 'First']),
+                        $this->contentBlockStop(0),
+                        $this->contentBlockStart(1, ['type' => 'server_tool_use', 'id' => 'srvtoolu_1', 'name' => 'web_search']),
+                        $this->contentBlockStop(1),
+                        $this->contentBlockStart(2, ['type' => 'text', 'text' => '']),
+                        $this->contentBlockDelta(2, ['type' => 'text_delta', 'text' => 'Second']),
+                        $this->contentBlockStop(2),
+                        $this->messageDelta('pause_turn', 5),
+                    ]),
+                    status: 200,
+                    headers: ['Content-Type' => 'text/event-stream'],
+                ),
+                Http::response(
+                    body: $this->ssePayload([
+                        $this->messageStart(),
+                        $this->messageDelta('end_turn', 5),
+                    ]),
+                    status: 200,
+                    headers: ['Content-Type' => 'text/event-stream'],
+                ),
+            ]),
+        ]);
+
+        $events = $this->collectStreamEvents();
+
+        $followUpBody = Http::recorded()[1][0]->data();
+        $replayed = end($followUpBody['messages'])['content'];
+
+        expect([$replayed[0]['text'], $replayed[2]['text']])->toBe(['First', 'Second'])
+            ->and(TextDelta::combine($events))->toBe("First\n\nSecond");
+    });
+
+    test('streaming does not separate text after a server tool when the model already ended the line', function (): void {
+        Http::fake([
+            'api.anthropic.com/*' => Http::response(
+                body: $this->ssePayload([
+                    $this->messageStart(),
+                    $this->contentBlockStart(0, ['type' => 'text', 'text' => '']),
+                    $this->contentBlockDelta(0, ['type' => 'text_delta', 'text' => "First\n"]),
+                    $this->contentBlockStop(0),
+                    $this->contentBlockStart(1, ['type' => 'server_tool_use', 'id' => 'srvtoolu_1', 'name' => 'web_search']),
+                    $this->contentBlockStop(1),
+                    $this->contentBlockStart(2, ['type' => 'text', 'text' => '']),
+                    $this->contentBlockDelta(2, ['type' => 'text_delta', 'text' => 'Second']),
+                    $this->contentBlockStop(2),
+                    $this->messageDelta('end_turn', 10),
+                ]),
+                status: 200,
+                headers: ['Content-Type' => 'text/event-stream'],
+            ),
+        ]);
+
+        $textDeltas = array_values(array_filter($this->collectStreamEvents(), fn ($e): bool => $e instanceof TextDelta));
+
+        expect(array_map(fn (TextDelta $e): string => $e->delta, $textDeltas))->toBe(["First\n", 'Second']);
+    });
 });
 
 describe('error handling', function (): void {
@@ -354,8 +420,8 @@ describe('usage tracking', function (): void {
         $streamEnd = array_values(array_filter($events, fn ($e): bool => $e instanceof StreamEnd))[0];
 
         expect($streamEnd->usage)
-            ->promptTokens->toBe(42)
-            ->completionTokens->toBe(10)
+            ->inputTokens->toBe(192)
+            ->outputTokens->toBe(10)
             ->cacheWriteInputTokens->toBe(100)
             ->cacheReadInputTokens->toBe(50)
             ->reasoningTokens->toBe(6);
@@ -404,8 +470,8 @@ describe('usage tracking', function (): void {
         $streamEnd = array_values(array_filter($events, fn ($e) => $e instanceof StreamEnd))[0];
 
         expect($streamEnd->usage)
-            ->promptTokens->toBe(10682)
-            ->completionTokens->toBe(510)
+            ->inputTokens->toBe(10782)
+            ->outputTokens->toBe(510)
             ->cacheWriteInputTokens->toBe(25)
             ->cacheReadInputTokens->toBe(75);
     });
@@ -473,8 +539,8 @@ describe('usage tracking', function (): void {
         expect($streamEnds)->toHaveCount(1)
             ->and($streamEnds[0]->reason)->toBe(FinishReason::Stop->value)
             ->and($streamEnds[0]->usage)
-            ->promptTokens->toBe(30)
-            ->completionTokens->toBe(15)
+            ->inputTokens->toBe(50)
+            ->outputTokens->toBe(15)
             ->cacheWriteInputTokens->toBe(10)
             ->cacheReadInputTokens->toBe(10);
     });

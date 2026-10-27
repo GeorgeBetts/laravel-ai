@@ -9,7 +9,7 @@ use Illuminate\Support\Collection;
 use IteratorAggregate;
 use Laravel\Ai\Responses\Data\Citation as CitationData;
 use Laravel\Ai\Responses\Data\Meta;
-use Laravel\Ai\Responses\Data\Usage;
+use Laravel\Ai\Responses\Data\TextUsage;
 use Laravel\Ai\Streaming\Events\Citation;
 use Laravel\Ai\Streaming\Events\ReasoningDelta;
 use Laravel\Ai\Streaming\Events\StreamEnd;
@@ -20,13 +20,14 @@ use Laravel\Ai\Streaming\Protocols\AgentUserInteractionProtocol;
 use Laravel\Ai\Streaming\Protocols\StreamProtocol;
 use Laravel\Ai\Streaming\Protocols\VercelDataProtocol;
 use Symfony\Component\HttpFoundation\Response;
+use Throwable;
 use Traversable;
 
 class StreamableAgentResponse implements IteratorAggregate, Responsable
 {
     public ?string $text = null;
 
-    public ?Usage $usage = null;
+    public ?TextUsage $usage = null;
 
     /** @var Collection<int, StreamEvent> */
     public Collection $events;
@@ -45,6 +46,8 @@ class StreamableAgentResponse implements IteratorAggregate, Responsable
     public string $reasoning = '';
 
     protected array $thenCallbacks = [];
+
+    protected array $catchCallbacks = [];
 
     protected ?StreamProtocol $protocol = null;
 
@@ -74,6 +77,16 @@ class StreamableAgentResponse implements IteratorAggregate, Responsable
                 break;
             }
         }
+
+        return $this;
+    }
+
+    /**
+     * Provide a callback that should be invoked when the stream fails.
+     */
+    public function catch(callable $callback): self
+    {
+        $this->catchCallbacks[] = $callback;
 
         return $this;
     }
@@ -141,6 +154,8 @@ class StreamableAgentResponse implements IteratorAggregate, Responsable
 
     /**
      * Stream the response using the Vercel AI SDK data stream protocol.
+     *
+     * The message ID is the assistant message being continued, not the "messageId" sent by useChat.
      */
     public function usingVercelDataProtocol(?string $messageId = null): self
     {
@@ -199,12 +214,25 @@ class StreamableAgentResponse implements IteratorAggregate, Responsable
         $events = [];
 
         // Resolve the stream of the prompt and yield the events...
-        foreach (call_user_func($this->generator) as $event) {
-            $events[] = $event;
+        try {
+            foreach (call_user_func($this->generator) as $event) {
+                $events[] = $event;
 
-            $this->hasYielded = true;
+                $this->hasYielded = true;
 
-            yield $event;
+                yield $event;
+            }
+        } catch (Throwable $exception) {
+            // Taken before invoking so a re-iterated stream does not report the same failure twice...
+            $callbacks = $this->catchCallbacks;
+
+            $this->catchCallbacks = [];
+
+            foreach ($callbacks as $callback) {
+                $callback($exception);
+            }
+
+            throw $exception;
         }
 
         $this->events = new Collection($events);

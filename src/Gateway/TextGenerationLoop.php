@@ -10,10 +10,15 @@ use Laravel\Ai\Approvals\Approval;
 use Laravel\Ai\Approvals\Decision;
 use Laravel\Ai\Approvals\PendingApproval;
 use Laravel\Ai\Attributes\RepairToolCalls;
+use Laravel\Ai\Concerns\JoinsReasoning;
 use Laravel\Ai\Contracts\Approvable;
 use Laravel\Ai\Contracts\Gateway\StepTextGateway;
 use Laravel\Ai\Contracts\HasMiddleware;
+use Laravel\Ai\Contracts\Providers\SupportsCodeExecution;
+use Laravel\Ai\Contracts\Providers\SupportsFileSearch;
 use Laravel\Ai\Contracts\Providers\SupportsToolSearch;
+use Laravel\Ai\Contracts\Providers\SupportsWebFetch;
+use Laravel\Ai\Contracts\Providers\SupportsWebSearch;
 use Laravel\Ai\Contracts\Providers\TextProvider;
 use Laravel\Ai\Contracts\Tool;
 use Laravel\Ai\Exceptions\ApprovalMismatchException;
@@ -25,17 +30,22 @@ use Laravel\Ai\Messages\AssistantMessage;
 use Laravel\Ai\Messages\Message;
 use Laravel\Ai\Messages\ToolResultMessage;
 use Laravel\Ai\PendingStep;
+use Laravel\Ai\Providers\Tools\CodeExecution;
+use Laravel\Ai\Providers\Tools\FileSearch;
 use Laravel\Ai\Providers\Tools\ProviderTool;
 use Laravel\Ai\Providers\Tools\ToolSearch;
+use Laravel\Ai\Providers\Tools\WebFetch;
+use Laravel\Ai\Providers\Tools\WebSearch;
 use Laravel\Ai\Responses\Data\FinishReason;
 use Laravel\Ai\Responses\Data\Meta;
 use Laravel\Ai\Responses\Data\Step;
+use Laravel\Ai\Responses\Data\TextUsage;
 use Laravel\Ai\Responses\Data\ToolCall;
 use Laravel\Ai\Responses\Data\ToolResult;
-use Laravel\Ai\Responses\Data\Usage;
 use Laravel\Ai\Responses\StructuredTextResponse;
 use Laravel\Ai\Responses\TextResponse;
 use Laravel\Ai\Streaming\Events\Error;
+use Laravel\Ai\Streaming\Events\ReasoningDelta;
 use Laravel\Ai\Streaming\Events\StreamEnd;
 use Laravel\Ai\Streaming\Events\StreamEvent;
 use Laravel\Ai\Streaming\Events\StreamStart;
@@ -53,7 +63,7 @@ use Throwable;
 
 class TextGenerationLoop
 {
-    use HandlesToolApprovals, InvokesTools;
+    use HandlesToolApprovals, InvokesTools, JoinsReasoning;
 
     /**
      * The characters a tool must add before its unfinished output is reported again.
@@ -90,14 +100,16 @@ class TextGenerationLoop
         ?Closure $recordApprovalResults = null,
         ?RunContext $context = null,
     ): TextResponse {
-        $this->ensureToolSearchIsApplicable($provider, $tools);
+        $this->ensureSingleToolSearch($tools);
+
+        $tools = $this->toolsSupportedBy($provider, $tools);
 
         $middleware = $this->middlewareFor($options);
         $steps = new Collection;
         $maxSteps = $this->resolveMaxSteps($options, $tools);
         $continuationToken = null;
         $previous = null;
-        $accumulatedUsage = new Usage;
+        $accumulatedUsage = new TextUsage;
         $lastResult = null;
 
         if ($approval !== null) {
@@ -111,8 +123,7 @@ class TextGenerationLoop
             }
 
             if (! $resumption->shouldContinue) {
-                return (new TextResponse('', new Usage, new Meta($provider->name(), $model)))
-                    ->withMessages(collect($newMessages));
+                return $this->emptyResponse($provider, $model, $newMessages);
             }
         } else {
             $allMessages = $this->settleAbandonedToolCalls($messages);
@@ -140,7 +151,7 @@ class TextGenerationLoop
             $attempt = null;
 
             try {
-                $lastResult = $this->runStep($pending, $middleware, function (PendingStep $step) use ($provider, $previous, $context, $allMessages, $continuationToken, &$attempt): StepResult {
+                $stepResult = $this->runStep($pending, $middleware, function (PendingStep $step) use ($provider, $previous, $context, $allMessages, $continuationToken, &$attempt): StepResult {
                     return $attempt = $this->attempt($step, $previous, $allMessages, $continuationToken, $context, fn (StepContext $stepContext): StepResponse => $this->gateway->generateTextStep(
                         $provider,
                         $step->model,
@@ -152,7 +163,13 @@ class TextGenerationLoop
                         $step->timeout,
                         $stepContext,
                     ));
-                })->response();
+                });
+
+                if ($stepResult->stopped()) {
+                    break;
+                }
+
+                $lastResult = $stepResult->response();
             } catch (Throwable $exception) {
                 $this->stepFailed($context, $attempt, $exception);
 
@@ -161,13 +178,18 @@ class TextGenerationLoop
 
             $prepared = $attempt?->step ?? $pending;
 
+            // Recorded before the tools run so a step that dies partway is still kept as far as it got...
+            $steps->push($completedStep = $this->buildStep($lastResult));
+
+            $context?->recordStep($completedStep);
+
             $this->stepCompleted($context, $attempt, $lastResult);
 
             $accumulatedUsage = $accumulatedUsage->add($lastResult->usage);
 
             [$toolResults, $pendingApprovals] = $this->stepToolResultsWithOptions($lastResult, $prepared->isFinalStep, $prepared->tools, $prepared->options, $context);
 
-            $steps->push($this->buildStep($lastResult, $toolResults));
+            $completedStep->toolResults = $toolResults;
 
             $assistantMessage = $this->buildAssistantMessage($lastResult);
             $allMessages[] = $assistantMessage;
@@ -192,7 +214,9 @@ class TextGenerationLoop
             $previous = $prepared;
         }
 
-        return $this->buildFinalResponse($steps, $newMessages, $lastResult);
+        return $lastResult === null
+            ? $this->emptyResponse($provider, $model, $newMessages)
+            : $this->buildFinalResponse($steps, $newMessages, $lastResult);
     }
 
     /**
@@ -216,14 +240,16 @@ class TextGenerationLoop
         ?array $validatedApproval = null,
         ?RunContext $context = null,
     ): Generator {
-        $this->ensureToolSearchIsApplicable($provider, $tools);
+        $this->ensureSingleToolSearch($tools);
+
+        $tools = $this->toolsSupportedBy($provider, $tools);
 
         $middleware = $this->middlewareFor($options);
         $steps = new Collection;
         $maxSteps = $this->resolveMaxSteps($options, $tools);
         $continuationToken = null;
         $previous = null;
-        $accumulatedUsage = new Usage;
+        $accumulatedUsage = new TextUsage;
         $finalReason = null;
 
         if ($approval !== null) {
@@ -260,8 +286,6 @@ class TextGenerationLoop
             $allMessages = $this->settleAbandonedToolCalls($messages);
         }
 
-        $providerSteps = [];
-
         for ($step = 0; $step < $maxSteps; $step++) {
             $pending = new PendingStep(
                 number: $step,
@@ -285,25 +309,39 @@ class TextGenerationLoop
 
             try {
                 $stepResult = $this->runStep($pending, $middleware, function (PendingStep $step) use ($invocationId, $provider, $previous, $context, $allMessages, $continuationToken, &$attempt): StepResult {
-                    return $attempt = $this->attempt($step, $previous, $allMessages, $continuationToken, $context, fn (StepContext $stepContext): Generator => $this->gateway->generateStreamStep(
-                        $invocationId,
-                        $provider,
-                        $step->model,
-                        $step->instructions,
-                        $step->messages,
-                        $step->tools,
-                        $step->schema,
-                        $step->options,
-                        $step->timeout,
-                        $stepContext,
-                    ));
+                    return $attempt = $this->attempt($step, $previous, $allMessages, $continuationToken, $context, function (StepContext $stepContext) use ($invocationId, $provider, $step) {
+                        return $this->gateway->generateStreamStep(
+                            $invocationId,
+                            $provider,
+                            $step->model,
+                            $step->instructions,
+                            $step->messages,
+                            $step->tools,
+                            $step->schema,
+                            $step->options,
+                            $step->timeout,
+                            $stepContext,
+                        );
+                    });
                 });
+
+                if ($stepResult->stopped()) {
+                    $finalReason = FinishReason::Cancelled;
+
+                    break;
+                }
+
+                $reasoningDeltas = [];
 
                 foreach ($stepResult as $event) {
                     yield $event;
 
                     if ($event instanceof Error) {
                         $lastError = $event;
+                    }
+
+                    if ($event instanceof ReasoningDelta) {
+                        $reasoningDeltas[] = $event;
                     }
                 }
 
@@ -312,6 +350,10 @@ class TextGenerationLoop
 
                 if (! $stepResult->streamed() && $result instanceof StepResponse) {
                     yield from $this->eventsFor($invocationId, $provider, $prepared->model, $result);
+                }
+
+                if ($result instanceof StepResponse && $result->reasoning === '') {
+                    $result->reasoning = ReasoningDelta::combine($reasoningDeltas);
                 }
             } catch (Throwable $exception) {
                 $this->stepFailed($context, $attempt, $exception);
@@ -327,6 +369,11 @@ class TextGenerationLoop
 
                 throw $exception;
             }
+
+            // Recorded before the tools run so a step that dies partway is still kept as far as it got...
+            $steps->push($completedStep = $this->buildStep($result));
+
+            $context?->recordStep($completedStep);
 
             $this->stepCompleted($context, $attempt, $result);
 
@@ -344,7 +391,7 @@ class TextGenerationLoop
 
             [$toolResults, $pendingApprovals] = $toolStream->getReturn();
 
-            $steps->push($this->buildStep($result, $toolResults));
+            $completedStep->toolResults = $toolResults;
 
             foreach ($toolResults as $toolResult) {
                 yield (new ToolResultEvent(
@@ -358,11 +405,6 @@ class TextGenerationLoop
 
             $allMessages[] = $this->buildAssistantMessage($result);
 
-            $providerSteps[] = [
-                'blocks' => $result->providerContentBlocks,
-                'tool_call_ids' => array_map(fn (ToolCall $toolCall): string => $toolCall->id, $result->toolCalls),
-            ];
-
             if (filled($toolResults)) {
                 $allMessages[] = new ToolResultMessage(collect($toolResults));
             }
@@ -372,8 +414,7 @@ class TextGenerationLoop
                     $this->generateEventId(),
                     $pendingApprovals,
                     time(),
-                    $providerSteps,
-                    $result->providerContentBlocks,
+                    $steps,
                 ))->withInvocationId($invocationId);
 
                 break;
@@ -393,6 +434,7 @@ class TextGenerationLoop
             ($finalReason ?? FinishReason::Stop)->value,
             $accumulatedUsage,
             time(),
+            $steps,
         ))->withInvocationId($invocationId);
     }
 
@@ -627,7 +669,7 @@ class TextGenerationLoop
 
             yield from $this->preliminaryToolResults($events, $toolCall, $invocationId);
 
-            $toolResults[] = $this->toolResult($toolCall, $events->getReturn());
+            $toolResults[] = $this->recordedToolResult($this->toolResult($toolCall, $events->getReturn()), $context);
         }
 
         return [$toolResults, $pendingApprovals];
@@ -725,7 +767,7 @@ class TextGenerationLoop
      */
     protected function resolvedToolResult(ToolCall $toolCall, ?Tool $tool, bool $isFinalStep, array $tools = [], ?RunContext $context = null): ToolResult
     {
-        return $this->toolResult(
+        return $this->recordedToolResult($this->toolResult(
             $toolCall,
             match (true) {
                 ! $tool instanceof Tool && $this->repairsToolCalls => "Tool '{$toolCall->name}' does not exist. Available tools: {$this->availableToolNames($tools)}.",
@@ -733,7 +775,17 @@ class TextGenerationLoop
                 default => $this->executeTool($tool, $toolCall->arguments, $toolCall->id, $context),
             },
             failed: ! $tool instanceof Tool || $isFinalStep,
-        );
+        ), $context);
+    }
+
+    /**
+     * Answer the recorded step with the result its tool just produced.
+     */
+    protected function recordedToolResult(ToolResult $result, ?RunContext $context): ToolResult
+    {
+        $context?->recordToolResult($result);
+
+        return $result;
     }
 
     /**
@@ -845,9 +897,11 @@ class TextGenerationLoop
         $hasBareRejection = false;
 
         foreach ($pendingToolCalls as $toolCall) {
-            $decision = $approval[$toolCall->id]
-                ?? $approval['*']
-                ?? Decision::reject('The user rejected this tool call.');
+            $tool = $resolvedTools[$toolCall->id];
+
+            $decision = $tool instanceof Tool && ! $tool instanceof Approvable
+                ? Decision::reject('This tool call was not executed because it was not pending approval.')
+                : $approval[$toolCall->id] ?? $approval['*'] ?? Decision::reject('The user rejected this tool call.');
 
             if ($decision->isRejected()) {
                 $hasBareRejection = $hasBareRejection || $decision->result === null;
@@ -865,7 +919,6 @@ class TextGenerationLoop
             }
 
             $arguments = $decision->arguments ?? $toolCall->arguments;
-            $tool = $resolvedTools[$toolCall->id];
 
             if (! $tool instanceof Tool) {
                 throw new NoSuchToolException($toolCall->name);
@@ -970,23 +1023,32 @@ class TextGenerationLoop
         return new AssistantMessage(
             $result->text,
             collect($result->toolCalls),
-            $result->providerContentBlocks,
+            $result->replayBlocks,
         );
     }
 
-    /**
-     * @param  ToolResult[]  $toolResults
-     */
-    protected function buildStep(StepResponse $result, array $toolResults = []): Step
+    protected function buildStep(StepResponse $result): Step
     {
         return (new Step(
             $result->text,
             $result->toolCalls,
-            $toolResults,
+            [],
             $result->finishReason,
             $result->usage,
             $result->meta,
+            $result->reasoning,
+            $result->replayBlocks,
+            $result->providerToolCalls,
         ))->withRawResponse($result->raw);
+    }
+
+    /**
+     * Build the response for a run that ended before any step completed.
+     */
+    protected function emptyResponse(TextProvider $provider, string $model, array $newMessages): TextResponse
+    {
+        return (new TextResponse('', new TextUsage, new Meta($provider->name(), $model)))
+            ->withMessages(collect($newMessages));
     }
 
     /**
@@ -999,9 +1061,11 @@ class TextGenerationLoop
     ): TextResponse {
         $finalStep = $steps->last();
 
+        $reasoningText = static::joinReasoning($steps->pluck('reasoning'));
+
         $totalUsage = $steps->reduce(
-            fn (Usage $carry, Step $step): Usage => $carry->add($step->usage),
-            new Usage,
+            fn (TextUsage $carry, Step $step): TextUsage => $carry->add($step->usage),
+            new TextUsage,
         );
 
         $newMessages = collect($newMessages)->values();
@@ -1017,35 +1081,44 @@ class TextGenerationLoop
                 toolResults: $newMessages
                     ->whereInstanceOf(ToolResultMessage::class)
                     ->flatMap(fn (ToolResultMessage $message): Collection => $message->toolResults),
-            )->withSteps($steps)->withRawResponse($lastResult->raw);
+            )->withSteps($steps)->withReasoning($reasoningText)->withRawResponse($lastResult->raw);
         }
 
         return (new TextResponse(
             $finalStep->text,
             $totalUsage,
             $finalStep->meta,
-        ))->withMessages($newMessages)->withSteps($steps)->withRawResponse($lastResult?->raw);
+        ))->withMessages($newMessages)->withSteps($steps)->withReasoning($reasoningText)->withRawResponse($lastResult?->raw);
     }
 
     /**
-     * Ensure hosted tool search is only used with a supporting provider and a single wrapper.
+     * Ensure at most one tool search wrapper is registered per request.
      *
      * @param  Tool[]  $tools
      */
-    protected function ensureToolSearchIsApplicable(TextProvider $provider, array $tools): void
+    protected function ensureSingleToolSearch(array $tools): void
     {
-        $wrappers = array_filter($tools, fn ($tool): bool => $tool instanceof ToolSearch);
-
-        if ($wrappers === []) {
-            return;
-        }
-
-        if (! $provider instanceof SupportsToolSearch) {
-            throw new LogicException("Provider [{$provider->name()}] does not support tool search.");
-        }
-
-        if (count($wrappers) > 1) {
+        if (count(array_filter($tools, fn ($tool): bool => $tool instanceof ToolSearch)) > 1) {
             throw new LogicException('Only a single tool search wrapper may be registered per request.');
         }
+    }
+
+    /**
+     * Drop provider tools the provider cannot run, unwrapping tool search into its deferred tools.
+     *
+     * @param  array<Tool|ProviderTool>  $tools
+     * @return array<Tool|ProviderTool>
+     */
+    protected function toolsSupportedBy(TextProvider $provider, array $tools): array
+    {
+        return (new Collection($tools))->flatMap(fn ($tool): array => match (true) {
+            $tool instanceof CodeExecution => $provider instanceof SupportsCodeExecution ? [$tool] : [],
+            $tool instanceof FileSearch => $provider instanceof SupportsFileSearch ? [$tool] : [],
+            $tool instanceof ToolSearch => $provider instanceof SupportsToolSearch ? [$tool] : $tool->tools,
+            $tool instanceof WebFetch => $provider instanceof SupportsWebFetch ? [$tool] : [],
+            $tool instanceof WebSearch => $provider instanceof SupportsWebSearch ? [$tool] : [],
+            $tool instanceof ProviderTool => [],
+            default => [$tool],
+        })->all();
     }
 }

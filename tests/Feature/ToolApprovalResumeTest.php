@@ -4,12 +4,16 @@ use Illuminate\Support\Facades\Config;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Http;
 use Laravel\Ai\Approvals\Decisions;
+use Laravel\Ai\Enums\MessageStatus;
 use Laravel\Ai\Exceptions\ApprovalMismatchException;
 use Laravel\Ai\Exceptions\RateLimitedException;
 use Laravel\Ai\Messages\ToolResultMessage;
+use Laravel\Ai\Responses\StructuredAgentResponse;
 use Laravel\Ai\Storage\DatabaseConversationStore;
 use Tests\Fixtures\Agents\RememberingApprovableAgent;
 use Tests\Fixtures\Agents\RememberingMultiStepApprovableAgent;
+use Tests\Fixtures\Agents\RememberingStructuredApprovableAgent;
+use Tests\Fixtures\Agents\RememberingToolUsingAgent;
 use Tests\Fixtures\Tools\ApprovableNumberGenerator;
 
 test('a remembered agent pauses for approval, persists the tool_use, and resumes from history when approved', function () {
@@ -58,9 +62,8 @@ test('a remembered agent pauses for approval, persists the tool_use, and resumes
         ->latest('id')
         ->first();
 
-    expect(json_decode($assistantRow->tool_calls, true))->toHaveCount(1)
-        ->and(json_decode($assistantRow->tool_calls, true)[0]['id'])->toBe('toolu_1')
-        ->and(json_decode($assistantRow->tool_results, true))->toBeEmpty();
+    expect($assistantRow->steps)->json()->toHaveCount(1)->{'0'}->tool_calls
+        ->toHaveCount(1)->each->toMatchArray(['id' => 'toolu_1'])->each->not->toHaveKey('result');
 
     $resumed = (new RememberingApprovableAgent)
         ->continue($paused->conversationId, $user)
@@ -119,8 +122,8 @@ test('an ownerless remembered agent pauses for approval and resumes without a pa
 
     expect($assistantRow->participant_type)->toBeNull()
         ->and($assistantRow->participant_id)->toBeNull()
-        ->and(json_decode($assistantRow->tool_calls, true)[0]['id'])->toBe('toolu_1')
-        ->and(json_decode($assistantRow->tool_results, true))->toBeEmpty();
+        ->and($assistantRow->steps)->json()->toHaveCount(1)->{'0'}->tool_calls
+        ->toHaveCount(1)->each->toMatchArray(['id' => 'toolu_1'])->each->not->toHaveKey('result');
 
     $resumed = (new RememberingApprovableAgent)
         ->continue($paused->conversationId)
@@ -132,7 +135,54 @@ test('an ownerless remembered agent pauses for approval and resumes without a pa
         ->and($resumed->toolResults[0]->result)->toBe('72019');
 });
 
-test('a resumed approval replays the paused turn provider content blocks', function () {
+test('a resume settles the paused turn and runs the tool once whoever resumes it', function (?object $resumer) {
+    Config::set('ai.conversations.generate_title', false);
+
+    ApprovableNumberGenerator::$invocations = 0;
+
+    Http::fake([
+        'api.anthropic.com/*' => Http::sequence([
+            Http::response([
+                'id' => 'msg_tool_1',
+                'type' => 'message',
+                'role' => 'assistant',
+                'model' => 'claude-sonnet-4-6',
+                'content' => [[
+                    'type' => 'tool_use',
+                    'id' => 'toolu_1',
+                    'name' => 'ApprovableNumberGenerator',
+                    'input' => (object) [],
+                ]],
+                'stop_reason' => 'tool_use',
+                'usage' => ['input_tokens' => 10, 'output_tokens' => 5],
+            ]),
+            Http::response([
+                'id' => 'msg_2',
+                'type' => 'message',
+                'role' => 'assistant',
+                'model' => 'claude-sonnet-4-6',
+                'content' => [['type' => 'text', 'text' => 'The number is 72019.']],
+                'stop_reason' => 'end_turn',
+                'usage' => ['input_tokens' => 10, 'output_tokens' => 5],
+            ]),
+        ]),
+    ]);
+
+    $paused = (new RememberingApprovableAgent)->forUser((object) ['id' => 1])->prompt('Generate a number', provider: 'anthropic');
+
+    $resumed = (new RememberingApprovableAgent)
+        ->continue($paused->conversationId, $resumer)
+        ->prompt(Decisions::from(['toolu_1' => true]), provider: 'anthropic');
+
+    expect($resumed->text)->toBe('The number is 72019.')
+        ->and(ApprovableNumberGenerator::$invocations)->toBe(1)
+        ->and((new DatabaseConversationStore)->pendingApprovalsFor($paused->conversationId))->toBe([]);
+})->with([
+    'another participant' => [fn () => (object) ['id' => 2]],
+    'no participant' => [null],
+]);
+
+test('a resumed approval replays the paused turn replay blocks', function () {
     Config::set('ai.conversations.generate_title', false);
 
     Http::fake([
@@ -289,11 +339,14 @@ test('a streamed multi-step pause stores every step so the resume replays each o
 
     $paused->each(fn () => true);
 
-    $meta = json_decode((string) DB::table('agent_conversation_messages')->where('role', 'assistant')->value('meta'), true);
+    $steps = DB::table('agent_conversation_messages')->where('role', 'assistant')->value('steps');
 
-    expect(collect($meta['provider_steps'])->pluck('tool_call_ids')->all())->toBe([['toolu_1'], ['toolu_2']])
-        ->and($meta['provider_steps'][0]['blocks'][0]['signature'])->toBe('signature-1')
-        ->and($meta['provider_steps'][1]['blocks'][0]['signature'])->toBe('signature-2');
+    expect($steps)->json()->toHaveCount(2)->sequence(
+        fn ($step) => $step->tool_calls->toHaveCount(1)->each->toMatchArray(['id' => 'toolu_1']),
+        fn ($step) => $step->tool_calls->toHaveCount(1)->each->toMatchArray(['id' => 'toolu_2']),
+    )
+        ->and($steps)->json()->{'0'}->replay_blocks->{'0'}->toMatchArray(['signature' => 'signature-1'])
+        ->and($steps)->json()->{'1'}->replay_blocks->{'0'}->toMatchArray(['signature' => 'signature-2']);
 
     $resumed = (new RememberingMultiStepApprovableAgent)
         ->continue($paused->conversationId, $user)
@@ -694,8 +747,8 @@ test('a successful resume records the approved result exactly once across histor
 
     $recorded = DB::table('agent_conversation_messages')
         ->where('conversation_id', $paused->conversationId)
-        ->pluck('tool_results')
-        ->flatMap(fn ($results) => collect(json_decode($results, true))->pluck('id'))
+        ->pluck('steps')
+        ->flatMap(fn ($steps) => collect(json_decode($steps, true))->flatMap(fn ($step) => collect($step['tool_calls'])->filter(fn (array $toolCall) => array_key_exists('result', $toolCall))->pluck('id')))
         ->filter(fn ($id) => $id === 'toolu_1');
 
     expect($recorded)->toHaveCount(1);
@@ -737,7 +790,7 @@ test('a rejected resume stores and rehydrates the tool result as denied', functi
         ->latest('id')
         ->first();
 
-    expect(json_decode($assistantRow->tool_results, true)[0]['denied'])->toBeTrue();
+    expect($assistantRow->steps)->json()->{'0'}->tool_calls->toHaveCount(1)->each->toMatchArray(['denied' => true]);
 
     $store = new DatabaseConversationStore;
     $messages = $store->getLatestConversationMessages($paused->conversationId, 10);
@@ -745,6 +798,79 @@ test('a rejected resume stores and rehydrates the tool result as denied', functi
     $toolResultMessage = $messages->first(fn ($message) => $message instanceof ToolResultMessage);
 
     expect($toolResultMessage->toolResults->first()->denied)->toBeTrue();
+});
+
+test('a rejected resume of a structured agent returns a structured response', function () {
+    Config::set('ai.conversations.generate_title', false);
+
+    Http::fake([
+        'api.anthropic.com/*' => Http::response([
+            'id' => 'msg_tool_1',
+            'type' => 'message',
+            'role' => 'assistant',
+            'model' => 'claude-sonnet-4-6',
+            'content' => [[
+                'type' => 'tool_use',
+                'id' => 'toolu_1',
+                'name' => 'ApprovableNumberGenerator',
+                'input' => (object) [],
+            ]],
+            'stop_reason' => 'tool_use',
+            'usage' => ['input_tokens' => 10, 'output_tokens' => 5],
+        ]),
+    ]);
+
+    $user = (object) ['id' => 1];
+
+    $paused = (new RememberingStructuredApprovableAgent)->forUser($user)->prompt('Generate a number', provider: 'anthropic');
+
+    $rejected = (new RememberingStructuredApprovableAgent)
+        ->continue($paused->conversationId, $user)
+        ->prompt(Decisions::from(['toolu_1' => false]), provider: 'anthropic');
+
+    expect($rejected)->toBeInstanceOf(StructuredAgentResponse::class)
+        ->and($rejected->structured)->toBe([]);
+});
+
+test('a wildcard rejection resume records the denial once, on the paused row', function () {
+    Config::set('ai.conversations.generate_title', false);
+
+    Http::fake([
+        'api.anthropic.com/*' => Http::response([
+            'id' => 'msg_tool_1',
+            'type' => 'message',
+            'role' => 'assistant',
+            'model' => 'claude-sonnet-4-6',
+            'content' => [[
+                'type' => 'tool_use',
+                'id' => 'toolu_1',
+                'name' => 'ApprovableNumberGenerator',
+                'input' => (object) [],
+            ]],
+            'stop_reason' => 'tool_use',
+            'usage' => ['input_tokens' => 10, 'output_tokens' => 5],
+        ]),
+    ]);
+
+    $user = (object) ['id' => 1];
+
+    $paused = (new RememberingApprovableAgent)->forUser($user)->prompt('Generate a number', provider: 'anthropic');
+
+    (new RememberingApprovableAgent)
+        ->continue($paused->conversationId, $user)
+        ->prompt(Decisions::from(['*' => false]), provider: 'anthropic');
+
+    $assistantRows = DB::table('agent_conversation_messages')
+        ->where('conversation_id', $paused->conversationId)
+        ->where('role', 'assistant')
+        ->get();
+
+    expect($assistantRows)->toHaveCount(1)
+        ->and($assistantRows->first()->steps)->json()->{'0'}->tool_calls->toHaveCount(1)->each->toMatchArray(['id' => 'toolu_1', 'denied' => true]);
+
+    $messages = (new DatabaseConversationStore)->getLatestConversationMessages($paused->conversationId, 10);
+
+    expect($messages->whereInstanceOf(ToolResultMessage::class))->toHaveCount(1);
 });
 
 test('a resume that fails after the tool runs does not re-execute the tool on retry', function () {
@@ -785,7 +911,7 @@ test('a resume that fails after the tool runs does not re-execute the tool on re
     expect(ApprovableNumberGenerator::$invocations)->toBe(1);
 });
 
-test('a resume settles the paused row before the run writes a newer one', function () {
+test('a resume folds its result and reply into the paused row instead of writing a newer one', function () {
     Config::set('ai.conversations.generate_title', false);
 
     Http::fake([
@@ -839,7 +965,6 @@ test('a resume settles the paused row before the run writes a newer one', functi
         ->continue($paused->conversationId, $user)
         ->prompt(Decisions::from(['toolu_1' => true, 'toolu_2' => true]), provider: 'anthropic');
 
-    // Only the newest row is read for pending approvals, so a resume that settled some calls and left others behind on an older row would report a finished turn while the user still owed a decision...
     $pausedRow = DB::table('agent_conversation_messages')->where('id', $pausedRowId)->first();
 
     $newerRows = DB::table('agent_conversation_messages')
@@ -847,7 +972,282 @@ test('a resume settles the paused row before the run writes a newer one', functi
         ->where('id', '>', $pausedRowId)
         ->count();
 
-    expect($newerRows)->toBeGreaterThan(0)
-        ->and(json_decode($pausedRow->approval_state, true)['pending'])->toBe([])
+    expect($newerRows)->toBe(0)
+        ->and($pausedRow->content)->toBe('The number is 72019.')
+        ->and($pausedRow->steps)->json()->toHaveCount(2)
         ->and($store->pendingApprovalsFor($paused->conversationId))->toBe([]);
+});
+
+test('a completed two-step turn replays step by step on the next prompt', function () {
+    Config::set('ai.conversations.generate_title', false);
+
+    $toolUse = fn (string $id, string $text) => Http::response([
+        'id' => "msg_{$id}",
+        'type' => 'message',
+        'role' => 'assistant',
+        'model' => 'claude-sonnet-4-6',
+        'content' => [
+            ['type' => 'text', 'text' => $text],
+            ['type' => 'tool_use', 'id' => $id, 'name' => 'FixedNumberGenerator', 'input' => (object) []],
+        ],
+        'stop_reason' => 'tool_use',
+        'usage' => ['input_tokens' => 10, 'output_tokens' => 5],
+    ]);
+
+    $text = fn (string $text) => Http::response([
+        'id' => 'msg_text',
+        'type' => 'message',
+        'role' => 'assistant',
+        'model' => 'claude-sonnet-4-6',
+        'content' => [['type' => 'text', 'text' => $text]],
+        'stop_reason' => 'end_turn',
+        'usage' => ['input_tokens' => 10, 'output_tokens' => 5],
+    ]);
+
+    Http::fake([
+        'api.anthropic.com/*' => Http::sequence([
+            $toolUse('toolu_1', 'First number'),
+            $toolUse('toolu_2', 'Second number'),
+            $text('The numbers are 72019 and 72019.'),
+            $text('Yes, both.'),
+        ]),
+    ]);
+
+    $user = (object) ['id' => 1];
+
+    $first = (new RememberingToolUsingAgent)->forUser($user)->prompt('Generate two numbers', provider: 'anthropic');
+
+    (new RememberingToolUsingAgent)->continue($first->conversationId, $user)->prompt('Are you sure?', provider: 'anthropic');
+
+    $history = collect(Http::recorded())->last()[0]->data()['messages'];
+
+    expect($history)->toHaveCount(7)->sequence(
+        fn ($message) => $message->toMatchArray(['role' => 'user']),
+        fn ($message) => $message->toMatchArray(['role' => 'assistant'])->content->toHaveCount(2)->sequence(
+            fn ($block) => $block->toMatchArray(['type' => 'text', 'text' => 'First number']),
+            fn ($block) => $block->toMatchArray(['type' => 'tool_use', 'id' => 'toolu_1']),
+        ),
+        fn ($message) => $message->toMatchArray(['role' => 'user'])->content->toHaveCount(1)->each->toMatchArray(['type' => 'tool_result', 'tool_use_id' => 'toolu_1']),
+        fn ($message) => $message->toMatchArray(['role' => 'assistant'])->content->toHaveCount(2)->sequence(
+            fn ($block) => $block->toMatchArray(['type' => 'text', 'text' => 'Second number']),
+            fn ($block) => $block->toMatchArray(['type' => 'tool_use', 'id' => 'toolu_2']),
+        ),
+        fn ($message) => $message->toMatchArray(['role' => 'user'])->content->toHaveCount(1)->each->toMatchArray(['type' => 'tool_result', 'tool_use_id' => 'toolu_2']),
+        fn ($message) => $message->toMatchArray(['role' => 'assistant'])->content->each->toMatchArray(['type' => 'text', 'text' => 'The numbers are 72019 and 72019.']),
+        fn ($message) => $message->toMatchArray(['role' => 'user'])->content->each->toMatchArray(['type' => 'text', 'text' => 'Are you sure?']),
+    );
+});
+
+test('a turn that pauses twice replays every step of the turn with its replay blocks on the second resume', function () {
+    Config::set('ai.conversations.generate_title', false);
+
+    $gated = fn (string $signature, string $id) => Http::response([
+        'id' => "msg_{$id}",
+        'type' => 'message',
+        'role' => 'assistant',
+        'model' => 'claude-sonnet-4-6',
+        'content' => [
+            ['type' => 'thinking', 'thinking' => 'Deciding.', 'signature' => $signature],
+            ['type' => 'tool_use', 'id' => $id, 'name' => 'ApprovableNumberGenerator', 'input' => (object) []],
+        ],
+        'stop_reason' => 'tool_use',
+        'usage' => ['input_tokens' => 10, 'output_tokens' => 5],
+    ]);
+
+    Http::fake([
+        'api.anthropic.com/*' => Http::sequence([
+            $gated('signature-1', 'toolu_1'),
+            $gated('signature-2', 'toolu_2'),
+            Http::response([
+                'id' => 'msg_text',
+                'type' => 'message',
+                'role' => 'assistant',
+                'model' => 'claude-sonnet-4-6',
+                'content' => [['type' => 'text', 'text' => 'Both numbers are 72019.']],
+                'stop_reason' => 'end_turn',
+                'usage' => ['input_tokens' => 10, 'output_tokens' => 5],
+            ]),
+        ]),
+    ]);
+
+    $user = (object) ['id' => 1];
+
+    $first = (new RememberingMultiStepApprovableAgent)->forUser($user)->prompt('Generate two gated numbers', provider: 'anthropic');
+
+    $second = (new RememberingMultiStepApprovableAgent)
+        ->continue($first->conversationId, $user)
+        ->prompt(Decisions::from(['toolu_1' => true]), provider: 'anthropic');
+
+    expect($first->pendingApprovals->pluck('id')->all())->toBe(['toolu_1'])
+        ->and($second->pendingApprovals->pluck('id')->all())->toBe(['toolu_2']);
+
+    (new RememberingMultiStepApprovableAgent)
+        ->continue($first->conversationId, $user)
+        ->prompt(Decisions::from(['toolu_2' => true]), provider: 'anthropic');
+
+    $history = collect(Http::recorded())->last()[0]->data()['messages'];
+
+    expect($history)->toHaveCount(5)->sequence(
+        fn ($message) => $message->toMatchArray(['role' => 'user']),
+        fn ($message) => $message->toMatchArray(['role' => 'assistant'])->content->{'0'}->toMatchArray(['type' => 'thinking', 'signature' => 'signature-1']),
+        fn ($message) => $message->toMatchArray(['role' => 'user'])->content->each->toMatchArray(['type' => 'tool_result', 'tool_use_id' => 'toolu_1']),
+        fn ($message) => $message->toMatchArray(['role' => 'assistant'])->content->{'0'}->toMatchArray(['type' => 'thinking', 'signature' => 'signature-2']),
+        fn ($message) => $message->toMatchArray(['role' => 'user'])->content->each->toMatchArray(['type' => 'tool_result', 'tool_use_id' => 'toolu_2']),
+    );
+});
+
+test('a plain call sharing a step with a gated call runs at the pause and both results land on the paused row', function () {
+    Config::set('ai.conversations.generate_title', false);
+
+    Http::fake([
+        'api.anthropic.com/*' => Http::sequence([
+            Http::response([
+                'id' => 'msg_1',
+                'type' => 'message',
+                'role' => 'assistant',
+                'model' => 'claude-sonnet-4-6',
+                'content' => [
+                    ['type' => 'tool_use', 'id' => 'toolu_plain', 'name' => 'FixedNumberGenerator', 'input' => (object) []],
+                    ['type' => 'tool_use', 'id' => 'toolu_gated', 'name' => 'ApprovableNumberGenerator', 'input' => (object) []],
+                ],
+                'stop_reason' => 'tool_use',
+                'usage' => ['input_tokens' => 10, 'output_tokens' => 5],
+            ]),
+            Http::response([
+                'id' => 'msg_2',
+                'type' => 'message',
+                'role' => 'assistant',
+                'model' => 'claude-sonnet-4-6',
+                'content' => [['type' => 'text', 'text' => 'Both done.']],
+                'stop_reason' => 'end_turn',
+                'usage' => ['input_tokens' => 10, 'output_tokens' => 5],
+            ]),
+        ]),
+    ]);
+
+    $user = (object) ['id' => 1];
+
+    $paused = (new RememberingMultiStepApprovableAgent)->forUser($user)->prompt('Go', provider: 'anthropic');
+
+    $store = new DatabaseConversationStore;
+
+    $pausedCalls = collect(json_decode(DB::table('agent_conversation_messages')->where('role', 'assistant')->value('steps'), true)[0]['tool_calls'])->keyBy('id');
+
+    expect($pausedCalls['toolu_plain'])->toHaveKey('result')->not->toHaveKey('approval_reason')
+        ->and($pausedCalls['toolu_gated'])->toHaveKey('approval_reason')->not->toHaveKey('result')
+        ->and($store->pendingApprovalsFor($paused->conversationId))->toHaveCount(1)->{'0'}->id->toBe('toolu_gated');
+
+    (new RememberingMultiStepApprovableAgent)
+        ->continue($paused->conversationId, $user)
+        ->prompt(Decisions::from(['toolu_gated' => true]), provider: 'anthropic');
+
+    $sentResultIds = collect(collect(Http::recorded())->last()[0]->data()['messages'])
+        ->flatMap(fn (array $message) => is_array($message['content']) ? $message['content'] : [])
+        ->where('type', 'tool_result')
+        ->pluck('tool_use_id')
+        ->all();
+
+    $row = DB::table('agent_conversation_messages')->where('role', 'assistant')->sole();
+    $calls = collect(json_decode($row->steps, true)[0]['tool_calls'])->keyBy('id');
+
+    expect($sentResultIds)->toBe(['toolu_plain', 'toolu_gated'])
+        ->and($calls['toolu_gated'])->toHaveKey('result')
+        ->and($store->pendingApprovalsFor($paused->conversationId))->toBe([]);
+});
+
+test('a resume that dies after a step fails the row it paused on instead of writing a newer one', function () {
+    Config::set('ai.conversations.generate_title', false);
+
+    Http::fake([
+        'api.anthropic.com/*' => Http::sequence()
+            ->push([
+                'id' => 'msg_tool_1',
+                'type' => 'message',
+                'role' => 'assistant',
+                'model' => 'claude-sonnet-4-6',
+                'content' => [['type' => 'tool_use', 'id' => 'toolu_1', 'name' => 'ApprovableNumberGenerator', 'input' => (object) []]],
+                'stop_reason' => 'tool_use',
+                'usage' => ['input_tokens' => 10, 'output_tokens' => 5],
+            ])
+            ->push([
+                'id' => 'msg_tool_2',
+                'type' => 'message',
+                'role' => 'assistant',
+                'model' => 'claude-sonnet-4-6',
+                'content' => [['type' => 'tool_use', 'id' => 'toolu_2', 'name' => 'FixedNumberGenerator', 'input' => (object) []]],
+                'stop_reason' => 'tool_use',
+                'usage' => ['input_tokens' => 10, 'output_tokens' => 5],
+            ])
+            ->pushStatus(500)
+            ->pushStatus(500)
+            ->pushStatus(500),
+    ]);
+
+    $user = (object) ['id' => 1];
+
+    $paused = (new RememberingMultiStepApprovableAgent)->forUser($user)->prompt('Generate a number', provider: 'anthropic');
+
+    $pausedRowId = DB::table('agent_conversation_messages')
+        ->where('conversation_id', $paused->conversationId)
+        ->where('role', 'assistant')
+        ->latest('id')
+        ->value('id');
+
+    expect(fn () => (new RememberingMultiStepApprovableAgent)
+        ->continue($paused->conversationId, $user)
+        ->prompt(Decisions::from(['toolu_1' => true]), provider: 'anthropic')
+    )->toThrow(Exception::class);
+
+    $rows = DB::table('agent_conversation_messages')
+        ->where('conversation_id', $paused->conversationId)
+        ->where('role', 'assistant')
+        ->get();
+
+    expect($rows)->toHaveCount(1)
+        ->and($rows->first()->id)->toBe($pausedRowId)
+        ->and($rows->first()->status)->toBe(MessageStatus::Failed->value)
+        ->and($rows->first()->steps)->json()->toHaveCount(2)
+        ->{'0'}->tool_calls->{'0'}->toMatchArray(['id' => 'toolu_1', 'result' => '72019'])
+        ->{'1'}->tool_calls->{'0'}->toMatchArray(['id' => 'toolu_2', 'result' => '72019']);
+});
+
+test('a resume that dies before its first step still fails the row its approval was written to', function () {
+    Config::set('ai.conversations.generate_title', false);
+
+    Http::fake([
+        'api.anthropic.com/*' => Http::sequence()
+            ->push([
+                'id' => 'msg_tool_1',
+                'type' => 'message',
+                'role' => 'assistant',
+                'model' => 'claude-sonnet-4-6',
+                'content' => [['type' => 'tool_use', 'id' => 'toolu_1', 'name' => 'ApprovableNumberGenerator', 'input' => (object) []]],
+                'stop_reason' => 'tool_use',
+                'usage' => ['input_tokens' => 10, 'output_tokens' => 5],
+            ])
+            ->pushStatus(500)
+            ->pushStatus(500)
+            ->pushStatus(500)
+            ->pushStatus(500),
+    ]);
+
+    $user = (object) ['id' => 1];
+
+    $paused = (new RememberingMultiStepApprovableAgent)->forUser($user)->prompt('Generate a number', provider: 'anthropic');
+
+    expect(fn () => (new RememberingMultiStepApprovableAgent)
+        ->continue($paused->conversationId, $user)
+        ->prompt(Decisions::from(['toolu_1' => true]), provider: 'anthropic')
+    )->toThrow(Exception::class);
+
+    $rows = DB::table('agent_conversation_messages')
+        ->where('conversation_id', $paused->conversationId)
+        ->where('role', 'assistant')
+        ->get();
+
+    expect($rows)->toHaveCount(1)
+        ->and($rows->first()->status)->toBe(MessageStatus::Failed->value)
+        ->and(json_decode($rows->first()->meta, true)['error'])->not->toBeEmpty()
+        ->and($rows->first()->steps)->json()->toHaveCount(1)
+        ->{'0'}->tool_calls->{'0'}->toMatchArray(['id' => 'toolu_1', 'result' => '72019']);
 });

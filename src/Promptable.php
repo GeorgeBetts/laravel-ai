@@ -20,7 +20,8 @@ use Laravel\Ai\Attributes\WithoutBroadcasting;
 use Laravel\Ai\Contracts\Agent;
 use Laravel\Ai\Contracts\AgentInput;
 use Laravel\Ai\Contracts\Conversational;
-use Laravel\Ai\Contracts\HasProviderOptions;
+use Laravel\Ai\Contracts\HasSkills;
+use Laravel\Ai\Contracts\HasStructuredOutput;
 use Laravel\Ai\Contracts\HasTools;
 use Laravel\Ai\Contracts\Providers\TextProvider;
 use Laravel\Ai\Contracts\Tool;
@@ -41,7 +42,9 @@ use Laravel\Ai\Responses\Data\Meta;
 use Laravel\Ai\Responses\QueuedAgentResponse;
 use Laravel\Ai\Responses\StreamableAgentResponse;
 use Laravel\Ai\Responses\StreamedAgentResponse;
+use Laravel\Ai\Responses\StructuredAgentResponse;
 use Laravel\Ai\Streaming\Events\StreamEvent;
+use Laravel\Ai\Tools\LoadSkill;
 use Laravel\Ai\Vercel\Vercel;
 use Laravel\SerializableClosure\SerializableClosure;
 use LogicException;
@@ -78,6 +81,8 @@ trait Promptable
 
     /**
      * Invoke the agent with a given prompt, or resume a paused run with tool approval decisions.
+     *
+     * @return ($this is HasStructuredOutput ? StructuredAgentResponse : AgentResponse)
      */
     public function prompt(
         AgentInput|UserMessage|Decisions|string $prompt,
@@ -387,7 +392,9 @@ trait Promptable
      */
     private function declaredTools(): array
     {
-        return $this instanceof HasTools ? [...$this->tools()] : [];
+        $tools = $this instanceof HasTools ? [...$this->tools()] : [];
+
+        return $this instanceof HasSkills ? LoadSkill::mergeInto($tools, $this) : $tools;
     }
 
     /**
@@ -457,12 +464,6 @@ trait Promptable
         foreach ($providers as $provider => $model) {
             $provider = Ai::textProviderFor($this, $provider);
 
-            if ($this instanceof HasProviderOptions) {
-                $provider = $provider->withHeaders($this->providerOptions(
-                    Lab::tryFrom($provider->driver()) ?? $provider->driver()
-                )[HasProviderOptions::HEADERS] ?? []);
-            }
-
             yield [$provider, $model ?? $this->getDefaultModelFor($provider), --$remaining === 0];
         }
     }
@@ -504,7 +505,7 @@ trait Promptable
 
         $resolved = $provider ?? config('ai.default');
 
-        if (is_array($resolved) && array_intersect(array_keys($resolved), ['text', 'image', 'audio', 'transcription', 'embedding', 'reranking'])) {
+        if (is_array($resolved) && array_intersect(array_keys($resolved), ['text', 'image', 'audio', 'transcription', 'embedding', 'reranking', 'classification'])) {
             throw new InvalidArgumentException('The "ai.default" config value must be a string provider name or a Lab enum, not an array.');
         }
 

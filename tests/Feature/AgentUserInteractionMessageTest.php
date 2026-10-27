@@ -53,7 +53,7 @@ describe('creating messages from AG-UI messages', function () {
             ['type' => 'text', 'text' => 'Second'],
         ]]);
 
-        expect($message->content)->toBe("First\n\nSecond");
+        expect($message->content)->toBe('First'.PHP_EOL.PHP_EOL.'Second');
     });
 
     test('url content sources become remote attachments', function () {
@@ -322,8 +322,7 @@ describe('hydrating AG-UI from stored messages', function () {
             yield new ConversationMessage([
                 'id' => 'msg-2',
                 'role' => 'assistant',
-                'tool_calls' => [['id' => 'call-1', 'name' => 'DeleteFile', 'arguments' => ['path' => 'a.txt']]],
-                'approval_state' => ['pending' => ['call-1' => 'Deletes a file.']],
+                'steps' => [['tool_calls' => [['id' => 'call-1', 'name' => 'DeleteFile', 'arguments' => ['path' => 'a.txt'], 'approval_reason' => 'Deletes a file.']]]],
             ]);
         })());
 
@@ -352,8 +351,7 @@ describe('hydrating AG-UI from stored messages', function () {
                 'id' => 'msg-2',
                 'role' => 'assistant',
                 'content' => null,
-                'tool_calls' => [['id' => 'call-1', 'name' => 'getWeather', 'arguments' => ['city' => 'Lisbon']]],
-                'tool_results' => [['id' => 'call-1', 'name' => 'getWeather', 'arguments' => ['city' => 'Lisbon'], 'result' => 'Sunny', 'result_id' => 'result-1']],
+                'steps' => [['tool_calls' => [['id' => 'call-1', 'name' => 'getWeather', 'arguments' => ['city' => 'Lisbon'], 'result' => 'Sunny', 'result_id' => 'result-1']]]],
             ]),
         ])['messages'];
 
@@ -371,25 +369,22 @@ describe('hydrating AG-UI from stored messages', function () {
         ]);
     });
 
-    test('tool results from an earlier turn hydrate before the resumed response', function () {
+    test('a folded approval turn hydrates its resolved result after the message that called it', function () {
         $messages = AgentUserInteraction::toClientState([
             new ConversationMessage([
                 'id' => 'msg-1',
                 'role' => 'assistant',
-                'tool_calls' => [['id' => 'call-1', 'name' => 'getWeather', 'arguments' => ['city' => 'Lisbon']]],
-            ]),
-            new ConversationMessage([
-                'id' => 'msg-2',
-                'role' => 'assistant',
                 'content' => 'It is sunny.',
-                'tool_results' => [['id' => 'call-1', 'name' => 'getWeather', 'arguments' => ['city' => 'Lisbon'], 'result' => 'Sunny']],
+                'steps' => [
+                    ['tool_calls' => [['id' => 'call-1', 'name' => 'getWeather', 'arguments' => ['city' => 'Lisbon'], 'approval_reason' => 'Costs money', 'result' => 'Sunny']]],
+                    ['content' => 'It is sunny.', 'tool_calls' => []],
+                ],
             ]),
         ])['messages'];
 
         expect($messages)->sequence(
-            fn ($message) => $message->role->toBe('assistant'),
-            fn ($message) => $message->role->toBe('tool'),
-            fn ($message) => $message->role->toBe('assistant'),
+            fn ($message) => $message->toMatchArray(['id' => 'msg-1', 'role' => 'assistant', 'content' => 'It is sunny.'])->toolCalls->toHaveCount(1),
+            fn ($message) => $message->toMatchArray(['role' => 'tool', 'toolCallId' => 'call-1', 'content' => 'Sunny']),
         );
     });
 
@@ -398,8 +393,7 @@ describe('hydrating AG-UI from stored messages', function () {
             new ConversationMessage([
                 'id' => 'msg-2',
                 'role' => 'assistant',
-                'tool_calls' => [['id' => 'call-1', 'name' => 'getWeather', 'arguments' => []]],
-                'tool_results' => [['id' => 'call-1', 'name' => 'getWeather', 'arguments' => [], 'result' => ['temp' => 21]]],
+                'steps' => [['tool_calls' => [['id' => 'call-1', 'name' => 'getWeather', 'arguments' => [], 'result' => ['temp' => 21]]]]],
             ]),
         ])['messages'];
 
@@ -412,9 +406,7 @@ describe('hydrating AG-UI from stored messages', function () {
             new ConversationMessage([
                 'id' => 'msg-2',
                 'role' => 'assistant',
-                'tool_calls' => [['id' => 'call-1', 'name' => 'DeleteFile', 'arguments' => ['path' => 'a.txt']]],
-                'tool_results' => [['id' => 'call-1', 'name' => 'DeleteFile', 'arguments' => ['path' => 'a.txt'], 'result' => null, 'denied' => true]],
-                'approval_state' => ['pending' => []],
+                'steps' => [['tool_calls' => [['id' => 'call-1', 'name' => 'DeleteFile', 'arguments' => ['path' => 'a.txt'], 'result' => null, 'denied' => true]]]],
             ]),
         ])['messages'];
 
@@ -428,8 +420,7 @@ describe('hydrating AG-UI from stored messages', function () {
             new ConversationMessage([
                 'id' => 'msg-2',
                 'role' => 'assistant',
-                'tool_calls' => [['id' => 'call-1', 'name' => 'ReadFile', 'arguments' => ['path' => 'a.txt']]],
-                'tool_results' => [['id' => 'call-1', 'name' => 'ReadFile', 'arguments' => ['path' => 'a.txt'], 'result' => 'The tool call failed: boom.', 'failed' => true]],
+                'steps' => [['tool_calls' => [['id' => 'call-1', 'name' => 'ReadFile', 'arguments' => ['path' => 'a.txt'], 'result' => 'The tool call failed: boom.', 'failed' => true]]]],
             ]),
         ])['messages'];
 
@@ -442,12 +433,10 @@ describe('hydrating AG-UI from stored messages', function () {
             new ConversationMessage([
                 'id' => 'msg-2',
                 'role' => 'assistant',
-                'tool_calls' => [
-                    ['id' => 'call-1', 'name' => 'DeleteFile', 'arguments' => ['path' => 'a.txt']],
-                    ['id' => 'call-2', 'name' => 'DeleteFile', 'arguments' => ['path' => 'b.txt']],
-                ],
-                'tool_results' => [],
-                'approval_state' => ['pending' => ['call-1' => 'Deletes a file.', 'call-2' => null]],
+                'steps' => [['tool_calls' => [
+                    ['id' => 'call-1', 'name' => 'DeleteFile', 'arguments' => ['path' => 'a.txt'], 'approval_reason' => 'Deletes a file.'],
+                    ['id' => 'call-2', 'name' => 'DeleteFile', 'arguments' => ['path' => 'b.txt'], 'approval_reason' => null],
+                ]]],
             ]),
         ]);
 
@@ -486,7 +475,7 @@ describe('hydrating AG-UI from stored messages', function () {
         ])->and(AgentUserInteraction::toInterrupts([new ConversationMessage([
             'id' => 'msg-2',
             'role' => 'assistant',
-            'approval_state' => ['pending' => ['call-1' => null]],
+            'steps' => [['tool_calls' => [['id' => 'call-1', 'approval_reason' => null]]]],
         ])])[0]['metadata'])->toEqual(['kind' => 'approval', 'toolName' => '', 'input' => (object) []]);
     });
 
@@ -568,8 +557,7 @@ describe('hydrating AG-UI from stored messages', function () {
                 'id' => 'msg-2',
                 'role' => 'assistant',
                 'content' => 'It is sunny.',
-                'tool_calls' => [['id' => 'call-1', 'name' => 'getWeather', 'arguments' => ['city' => 'Lisbon']]],
-                'tool_results' => [['id' => 'call-1', 'name' => 'getWeather', 'arguments' => ['city' => 'Lisbon'], 'result' => 'Sunny']],
+                'steps' => [['tool_calls' => [['id' => 'call-1', 'name' => 'getWeather', 'arguments' => ['city' => 'Lisbon'], 'result' => 'Sunny']]]],
             ]),
         ]);
 

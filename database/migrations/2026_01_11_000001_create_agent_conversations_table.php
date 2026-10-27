@@ -33,11 +33,10 @@ return new class extends AiMigration
             $table->string('role', 25);
             $table->text('content');
             $table->text('attachments');
-            $table->text('tool_calls');
-            $table->text('tool_results');
+            $table->longText('steps');
             $table->text('usage');
             $table->text('meta');
-            $table->text('approval_state')->nullable();
+            $table->string('status', 25);
             $table->timestamps();
 
             $table->index(['conversation_id', 'participant_type', 'participant_id', 'updated_at'], 'conversation_index');

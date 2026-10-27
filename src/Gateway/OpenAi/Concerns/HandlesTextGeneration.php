@@ -7,9 +7,9 @@ use Illuminate\Support\Str;
 use Laravel\Ai\Gateway\StepResponse;
 use Laravel\Ai\Providers\Provider;
 use Laravel\Ai\Responses\Data\Meta;
+use Laravel\Ai\Responses\Data\TextUsage;
 use Laravel\Ai\Responses\Data\ToolCall;
 use Laravel\Ai\Responses\Data\UrlCitation;
-use Laravel\Ai\Responses\Data\Usage;
 use Laravel\Ai\Streaming\Events\Citation as CitationEvent;
 use Laravel\Ai\Streaming\Events\Error;
 use Laravel\Ai\Streaming\Events\ProviderToolEvent;
@@ -47,16 +47,18 @@ trait HandlesTextGeneration
         foreach ($this->parseServerSentEvents($streamBody) as $data) {
             $type = $data['type'] ?? '';
 
-            if ($type === 'error') {
+            if ($type === 'error' || $type === 'response.failed') {
+                $error = $data['response']['error'] ?? $data['error'] ?? $data;
+
                 yield (new Error(
                     $this->generateEventId(),
-                    $data['error']['code'] ?? 'unknown_error',
-                    $data['error']['message'] ?? 'Unknown error',
+                    $error['code'] ?? 'unknown_error',
+                    $error['message'] ?? 'Unknown error',
                     false,
                     time(),
                 ))->withInvocationId($invocationId);
 
-                return;
+                return null;
             }
 
             if ($type === 'response.created' && ! $streamStartEmitted) {
@@ -284,7 +286,7 @@ trait HandlesTextGeneration
                 continue;
             }
 
-            if ($type === 'response.completed') {
+            if ($type === 'response.completed' || $type === 'response.incomplete') {
                 $response = $data['response'] ?? [];
                 $responseData = $response;
                 $responseId = $response['id'] ?? $responseId;
@@ -293,16 +295,19 @@ trait HandlesTextGeneration
             }
         }
 
+        if ($responseData === []) {
+            return null;
+        }
+
         return new StepResponse(
             text: $currentText,
             toolCalls: $toolCalls,
             finishReason: $this->extractFinishReason($responseData),
-            usage: $usage ?? new Usage(0, 0),
+            usage: $usage ?? new TextUsage(0, 0),
             meta: new Meta($provider->name(), $responseData['model'] ?? $model),
             continuationToken: $responseId,
-            providerContentBlocks: $this->isStateless($provider)
-                ? $this->extractReplayBlocks($responseData['output'] ?? [])
-                : [],
+            replayBlocks: $this->extractReplayBlocks($responseData['output'] ?? []),
+            providerToolCalls: $this->extractProviderToolCalls($responseData['output'] ?? []),
         );
     }
 

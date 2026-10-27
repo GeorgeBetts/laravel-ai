@@ -6,6 +6,7 @@ use Illuminate\Http\Request;
 use Illuminate\Support\Collection;
 use Illuminate\Support\Str;
 use InvalidArgumentException;
+use Laravel\Ai\Approvals\PendingApproval;
 use Laravel\Ai\Contracts\Files\StorableFile;
 use Laravel\Ai\Files\Base64Audio;
 use Laravel\Ai\Files\Base64Document;
@@ -97,9 +98,20 @@ class Vercel
     protected static function uiPartsFrom(Message|ConversationMessage $message): array
     {
         $parts = [];
+        $provider = $message instanceof ConversationMessage ? (string) (($message->meta ?? [])['provider'] ?? '') : '';
 
-        if ($message instanceof ConversationMessage && filled($reasoning = $message->meta['reasoning'] ?? null)) {
-            $parts[] = ['type' => 'reasoning', 'text' => $reasoning];
+        foreach ($message instanceof ConversationMessage ? $message->steps ?? [] : [] as $step) {
+            if (filled($step['reasoning'] ?? null)) {
+                $parts[] = ['type' => 'reasoning', 'text' => $step['reasoning']];
+            }
+
+            foreach ($step['provider_tool_calls'] ?? [] as $call) {
+                $parts[] = [
+                    'type' => 'custom',
+                    'kind' => $provider.'.'.$call['type'],
+                    'providerMetadata' => [$provider => ['itemId' => $call['id'], 'status' => 'completed', 'data' => $call['data']]],
+                ];
+            }
         }
 
         if (filled($message->content)) {
@@ -112,12 +124,8 @@ class Vercel
             }
         }
 
-        $pending = $message instanceof ConversationMessage
-            ? (array) (($message->approval_state ?? [])['pending'] ?? [])
-            : [];
-
         foreach (static::toolCallArraysFrom($message) as $toolCall) {
-            $isPending = array_key_exists($toolCall['id'], $pending);
+            $isPending = PendingApproval::isPending($toolCall);
 
             $parts[] = [
                 'type' => 'tool-'.$toolCall['name'],
@@ -125,7 +133,7 @@ class Vercel
                 'state' => $isPending ? 'approval-requested' : 'input-available',
                 'input' => $toolCall['arguments'],
                 ...($isPending
-                    ? ['approval' => ['id' => $toolCall['id'], 'reason' => $pending[$toolCall['id']]]]
+                    ? ['approval' => ['id' => $toolCall['id'], 'reason' => $toolCall['approval_reason']]]
                     : []),
             ];
         }

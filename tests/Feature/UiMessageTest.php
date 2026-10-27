@@ -18,6 +18,7 @@ use Laravel\Ai\Models\ConversationMessage;
 use Laravel\Ai\Prompts\AgentPrompt;
 use Laravel\Ai\Responses\Data\ToolCall;
 use Laravel\Ai\Responses\Data\ToolResult;
+use Laravel\Ai\Streaming\Protocols\VercelDataProtocol;
 use Laravel\Ai\Vercel\Vercel;
 use Tests\Fixtures\Agents\AssistantAgent;
 use Tests\Fixtures\Agents\RememberingAssistantAgent;
@@ -341,6 +342,24 @@ describe('chat input from a useChat request', function () {
         expect($chat->decisions())->toBeNull();
     });
 
+    test('a resume turn continues the trailing assistant message', function () {
+        $chat = Vercel::chat([
+            ['id' => 'm1', 'role' => 'user', 'parts' => [['type' => 'text', 'text' => 'Delete a.txt']]],
+            ['id' => 'm2', 'role' => 'assistant', 'parts' => [
+                ['type' => 'tool-DeleteFile', 'toolCallId' => 'call-1', 'state' => 'approval-responded', 'input' => ['path' => 'a.txt'], 'approval' => ['id' => 'call-1', 'approved' => true]],
+            ]],
+        ]);
+
+        expect($chat->messageId())->toBe('m2');
+    });
+
+    test('a trailing user message continues no message', function () {
+        $chat = Vercel::chat(useChatMessages());
+
+        expect($chat->messageId())->toBeNull()
+            ->and($chat->protocol())->toEqual(new VercelDataProtocol);
+    });
+
     test('a chat prompts an agent directly', function () {
         AssistantAgent::fake(['Taylor Otwell.']);
 
@@ -381,7 +400,7 @@ describe('hydrating useChat from stored messages', function () {
                 'id' => 'msg-2',
                 'role' => 'assistant',
                 'content' => 'It is 12°C.',
-                'meta' => ['reasoning' => 'They want the temperature.'],
+                'steps' => [['tool_calls' => [], 'reasoning' => 'They want the temperature.']],
             ]),
         ]);
 
@@ -391,14 +410,53 @@ describe('hydrating useChat from stored messages', function () {
         ]);
     });
 
+    test('conversation message models hydrate the reasoning of every step', function () {
+        $ui = Vercel::toUiMessages([
+            new ConversationMessage([
+                'id' => 'msg-2',
+                'role' => 'assistant',
+                'content' => 'Done.',
+                'steps' => [
+                    ['tool_calls' => [['id' => 'call-1', 'name' => 'ReadFile', 'arguments' => [], 'result' => 'a']], 'reasoning' => 'Read a first.'],
+                    ['tool_calls' => [], 'reasoning' => 'Now answer.'],
+                ],
+            ]),
+        ]);
+
+        expect(array_slice($ui[0]['parts'], 0, 2))->toBe([
+            ['type' => 'reasoning', 'text' => 'Read a first.'],
+            ['type' => 'reasoning', 'text' => 'Now answer.'],
+        ]);
+    });
+
+    test('stored provider tool calls hydrate as the custom parts the stream emitted', function () {
+        $ui = Vercel::toUiMessages([
+            new ConversationMessage([
+                'id' => 'msg-2',
+                'role' => 'assistant',
+                'content' => 'Found it.',
+                'meta' => ['provider' => 'openai'],
+                'steps' => [['tool_calls' => [], 'provider_tool_calls' => [['id' => 'ws-1', 'type' => 'web_search_call', 'data' => ['query' => 'laravel']]]]],
+            ]),
+        ]);
+
+        expect($ui[0]['parts'])->toBe([
+            [
+                'type' => 'custom',
+                'kind' => 'openai.web_search_call',
+                'providerMetadata' => ['openai' => ['itemId' => 'ws-1', 'status' => 'completed', 'data' => ['query' => 'laravel']]],
+            ],
+            ['type' => 'text', 'text' => 'Found it.'],
+        ]);
+    });
+
     test('a completed tool turn hydrates as a settled tool part instead of a blank bubble', function () {
         $ui = Vercel::toUiMessages([
             new ConversationMessage([
                 'id' => 'msg-2',
                 'role' => 'assistant',
                 'content' => null,
-                'tool_calls' => [['id' => 'call-1', 'name' => 'getWeather', 'arguments' => ['city' => 'Lisbon']]],
-                'tool_results' => [['id' => 'call-1', 'name' => 'getWeather', 'arguments' => ['city' => 'Lisbon'], 'result' => 'Sunny']],
+                'steps' => [['tool_calls' => [['id' => 'call-1', 'name' => 'getWeather', 'arguments' => ['city' => 'Lisbon'], 'result' => 'Sunny']]]],
             ]),
         ]);
 
@@ -417,9 +475,7 @@ describe('hydrating useChat from stored messages', function () {
                 'id' => 'msg-2',
                 'role' => 'assistant',
                 'content' => null,
-                'tool_calls' => [['id' => 'call-1', 'name' => 'DeleteFile', 'arguments' => ['path' => 'a.txt']]],
-                'tool_results' => [],
-                'approval_state' => ['pending' => ['call-1' => 'Deletes a file.']],
+                'steps' => [['tool_calls' => [['id' => 'call-1', 'name' => 'DeleteFile', 'arguments' => ['path' => 'a.txt'], 'approval_reason' => 'Deletes a file.']]]],
             ]),
         ]);
 
@@ -433,9 +489,7 @@ describe('hydrating useChat from stored messages', function () {
                 'id' => 'msg-2',
                 'role' => 'assistant',
                 'content' => null,
-                'tool_calls' => [['id' => 'call-1', 'name' => 'DeleteFile', 'arguments' => ['path' => 'a.txt']]],
-                'tool_results' => [['id' => 'call-1', 'name' => 'DeleteFile', 'arguments' => ['path' => 'a.txt'], 'result' => null, 'denied' => true]],
-                'approval_state' => ['pending' => []],
+                'steps' => [['tool_calls' => [['id' => 'call-1', 'name' => 'DeleteFile', 'arguments' => ['path' => 'a.txt'], 'approval_reason' => 'Deletes a file.', 'result' => null, 'denied' => true]]]],
             ]),
         ]);
 

@@ -7,8 +7,8 @@ use Illuminate\Support\Str;
 use Laravel\Ai\Gateway\StepResponse;
 use Laravel\Ai\Providers\Provider;
 use Laravel\Ai\Responses\Data\Meta;
+use Laravel\Ai\Responses\Data\TextUsage;
 use Laravel\Ai\Responses\Data\ToolCall;
-use Laravel\Ai\Responses\Data\Usage;
 use Laravel\Ai\Streaming\Events\Citation as CitationEvent;
 use Laravel\Ai\Streaming\Events\Error;
 use Laravel\Ai\Streaming\Events\ProviderToolEvent;
@@ -268,15 +268,7 @@ trait HandlesTextStreaming
                 $response = $data['response'] ?? [];
                 $responseData = $response;
                 $responseId = $response['id'] ?? $responseId;
-                $responseUsage = $response['usage'] ?? [];
-
-                $usage = new Usage(
-                    ($responseUsage['input_tokens'] ?? 0) - ($responseUsage['input_tokens_details']['cached_tokens'] ?? 0),
-                    $responseUsage['output_tokens'] ?? 0,
-                    0,
-                    $responseUsage['input_tokens_details']['cached_tokens'] ?? 0,
-                    $responseUsage['output_tokens_details']['reasoning_tokens'] ?? 0,
-                );
+                $usage = $this->extractUsage($response);
 
                 foreach ($this->extractCitations($response['output'] ?? []) as $citation) {
                     yield (new CitationEvent(
@@ -293,9 +285,10 @@ trait HandlesTextStreaming
             text: $currentText,
             toolCalls: $toolCalls,
             finishReason: $this->extractFinishReason($responseData),
-            usage: $usage ?? new Usage(0, 0),
+            usage: $usage ?? new TextUsage(0, 0),
             meta: new Meta($provider->name(), $responseData['model'] ?? $model),
             continuationToken: $responseId,
+            providerToolCalls: $this->extractProviderToolCalls($responseData['output'] ?? []),
         );
     }
 

@@ -2,14 +2,13 @@
 
 namespace Laravel\Ai\Gateway\Xai;
 
-use Illuminate\Support\Collection;
 use Laravel\Ai\Contracts\Gateway\ImageGateway;
 use Laravel\Ai\Contracts\Providers\ImageProvider;
 use Laravel\Ai\Files\Image;
 use Laravel\Ai\Gateway\Concerns\HandlesFailoverErrors;
 use Laravel\Ai\Responses\Data\GeneratedImage;
+use Laravel\Ai\Responses\Data\ImageUsage;
 use Laravel\Ai\Responses\Data\Meta;
-use Laravel\Ai\Responses\Data\Usage;
 use Laravel\Ai\Responses\ImageResponse;
 
 class XaiImageGateway implements ImageGateway
@@ -49,10 +48,11 @@ class XaiImageGateway implements ImageGateway
         $response = $response->json();
 
         return new ImageResponse(
-            new Collection([
-                new GeneratedImage($response['data'][0]['b64_json'], 'image/jpeg'),
-            ]),
-            new Usage,
+            collect($response['data'] ?? [])->map(fn (array $image): GeneratedImage => new GeneratedImage(
+                $image['b64_json'] ?? '',
+                'image/jpeg',
+            )),
+            new ImageUsage,
             new Meta($provider->name(), $model),
         );
     }
